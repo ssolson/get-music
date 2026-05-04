@@ -10,6 +10,71 @@ from googleapiclient.discovery import build
 from mutagen.id3 import ID3, TIT2, TPE1, TALB
 from mutagen.mp3 import MP3
 from urllib.parse import parse_qs, urlparse
+from yt_dlp import YoutubeDL
+
+# All playlist downloads and special playlists (e.g. Liked Music) go here.
+MUSIC_DIR = Path("music")
+
+# TXXX description values yt-dlp / ffmpeg often use for URL and YouTube prose.
+_STRIP_TXXX_DESCS = frozenset(
+    {"comment", "description", "purl", "synopsis", "artist url", "artist_url"}
+)
+
+
+def _strip_youtube_embedded_junk(tags: ID3) -> None:
+    """Remove ID3 frames that carry YouTube descriptions, URLs, and comment fields."""
+    to_delete = [
+        key
+        for key in tags.keys()
+        if key.startswith("COMM")
+        or key.startswith("USLT")
+        or key.startswith("WOAR")
+        or key.startswith("WXXX")
+        or (
+            key.startswith("TXXX:")
+            and key.split(":", 1)[1].lower() in _STRIP_TXXX_DESCS
+        )
+    ]
+    for key in to_delete:
+        del tags[key]
+
+
+def strip_youtube_metadata_from_file(file_path: Path) -> bool:
+    """Strip YouTube URL/description metadata from one MP3. Returns True if the file was changed."""
+    try:
+        audio = MP3(file_path, ID3=ID3)
+    except Exception as e:
+        print(f"Skip '{file_path}': {e}")
+        return False
+    if audio.tags is None:
+        return False
+    before = len(audio.tags.keys())
+    _strip_youtube_embedded_junk(audio.tags)
+    if len(audio.tags.keys()) == before:
+        return False
+    audio.save(v2_version=3)
+    print(f"Stripped YouTube URL/description metadata from '{file_path}'.")
+    return True
+
+
+def _yt_dlp_metadata_sanitize_args() -> list[str]:
+    """Clear infodict fields before embed so ffmpeg writes less junk into the file."""
+    return [
+        "--replace-in-metadata",
+        "description,comment,synopsis,purl",
+        ".*",
+        "",
+    ]
+
+
+def _yt_dlp_mp3_quality_args() -> list[str]:
+    """Prefer the best YouTube audio stream and avoid yt-dlp's default lame quality (5)."""
+    return [
+        "-f",
+        "bestaudio/best",
+        "--audio-quality",
+        "0",
+    ]
 
 
 PLAYLISTS = {
@@ -81,10 +146,11 @@ def set_mp3_metadata(
         if audio.tags is None:
             audio.add_tags()
 
+        _strip_youtube_embedded_junk(audio.tags)
         audio.tags["TIT2"] = TIT2(encoding=3, text=title)
         audio.tags["TPE1"] = TPE1(encoding=3, text=artist)
         audio.tags["TALB"] = TALB(encoding=3, text=album)
-        audio.save()
+        audio.save(v2_version=3)
 
         print(f"Metadata fixed for '{file_path}'.")
     except Exception as e:
@@ -140,6 +206,60 @@ def get_playlist_videos(youtube: Any, playlist_id: str) -> list[dict[str, str]]:
     return videos
 
 
+def _channel_title_as_artist(channel_title: str) -> str:
+    """YouTube Music often uses '<Artist> - Topic' as the channel name."""
+    t = channel_title.strip()
+    suffix = " - topic"
+    if t.lower().endswith(suffix):
+        return t[: -len(suffix)].strip()
+    return t
+
+
+def fetch_ytdlp_album(url: str) -> str | None:
+    """Album name when YouTube / YouTube Music exposes it (no download)."""
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        print(f"Warning: could not resolve album from yt-dlp for {url!r}: {e}")
+        return None
+    if not info:
+        return None
+    album = info.get("album")
+    if isinstance(album, list):
+        album = album[0] if album else None
+    if isinstance(album, str):
+        s = album.strip()
+        return s or None
+    return None
+
+
+def hydrate_video_artists(youtube: Any, videos: list[dict[str, str]]) -> None:
+    """Set each video's ``artist`` from ``videos.list`` ``channelTitle`` (up to 50 IDs per request)."""
+    for i in range(0, len(videos), 50):
+        chunk = videos[i : i + 50]
+        ids = ",".join(v["video_id"] for v in chunk)
+        try:
+            resp = youtube.videos().list(part="snippet", id=ids, maxResults=50).execute()
+        except Exception as e:
+            print(f"Warning: could not resolve artists for batch at index {i}: {e}")
+            for v in chunk:
+                v["artist"] = "Unknown Artist"
+            continue
+        by_id = {
+            item["id"]: _channel_title_as_artist(item["snippet"]["channelTitle"])
+            for item in resp.get("items", [])
+        }
+        for v in chunk:
+            v["artist"] = by_id.get(v["video_id"], "Unknown Artist")
+
+
 def download_video_as_mp3(url: str, output_template: Path) -> None:
     subprocess.run(
         [
@@ -147,6 +267,7 @@ def download_video_as_mp3(url: str, output_template: Path) -> None:
             "--extract-audio",
             "--audio-format",
             "mp3",
+            *_yt_dlp_mp3_quality_args(),
             "--output",
             str(output_template),
             "--retries",
@@ -158,6 +279,7 @@ def download_video_as_mp3(url: str, output_template: Path) -> None:
             "--continue",
             "--add-metadata",
             "--embed-metadata",
+            *_yt_dlp_metadata_sanitize_args(),
             "--metadata-from-title",
             "%(title)s",
             url,
@@ -172,8 +294,8 @@ def process_special_playlist(
     cookies_file: str | None = None,
     folder_name: str = "Liked Music",
 ) -> None:
-    playlist_dir = Path(folder_name)
-    playlist_dir.mkdir(exist_ok=True)
+    playlist_dir = MUSIC_DIR / sanitize_filename(folder_name)
+    playlist_dir.mkdir(parents=True, exist_ok=True)
     cookies_args = (
         ["--cookies", cookies_file]
         if cookies_file
@@ -186,6 +308,7 @@ def process_special_playlist(
             "--extract-audio",
             "--audio-format",
             "mp3",
+            *_yt_dlp_mp3_quality_args(),
             "--output",
             str(playlist_dir / "%(title)s.%(ext)s"),
             "--retries",
@@ -197,11 +320,14 @@ def process_special_playlist(
             "--continue",
             "--add-metadata",
             "--embed-metadata",
+            *_yt_dlp_metadata_sanitize_args(),
             *cookies_args,
             url,
         ],
         check=False,
     )
+    for mp3_path in playlist_dir.glob("*.mp3"):
+        strip_youtube_metadata_from_file(mp3_path)
 
 
 def process_playlist(youtube: Any, playlist_id: str, metadata_only: bool = False) -> None:
@@ -212,8 +338,8 @@ def process_playlist(youtube: Any, playlist_id: str, metadata_only: bool = False
     snippet = playlist["snippet"]
     playlist_title = snippet["title"]
     safe_playlist_title = sanitize_filename(playlist_title)
-    playlist_dir = Path(safe_playlist_title)
-    playlist_dir.mkdir(exist_ok=True)
+    playlist_dir = MUSIC_DIR / safe_playlist_title
+    playlist_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Title: {playlist_title}")
     print(f"Description: {snippet['description']}")
@@ -221,23 +347,26 @@ def process_playlist(youtube: Any, playlist_id: str, metadata_only: bool = False
     print(f"Number of videos: {playlist['contentDetails']['itemCount']}")
 
     videos = get_playlist_videos(youtube, playlist_id)
+    hydrate_video_artists(youtube, videos)
 
     for video in videos:
         title = video["title"]
+        artist = video["artist"]
+        album = fetch_ytdlp_album(video["url"]) or playlist_title
         safe_title = sanitize_filename(title)
         output_file = playlist_dir / f"{safe_title}.mp3"
 
         if metadata_only:
             if output_file.exists():
                 print(f"Fixing metadata for '{output_file}'...")
-                set_mp3_metadata(output_file, title=title, artist="YouTube", album=playlist_title)
+                set_mp3_metadata(output_file, title=title, artist=artist, album=album)
             else:
                 print(f"File '{output_file}' does not exist. Skipping.")
             continue
 
         print(f"Downloading '{title}'...")
         download_video_as_mp3(video["url"], playlist_dir / f"{safe_title}.%(ext)s")
-        set_mp3_metadata(output_file, title=title, album=playlist_title)
+        set_mp3_metadata(output_file, title=title, artist=artist, album=album)
 
 
 def main() -> None:
@@ -259,7 +388,26 @@ def main() -> None:
         default=os.getenv("YT_DLP_COOKIES_FILE"),
         help="Path to a Netscape cookies.txt file for special playlists.",
     )
+    parser.add_argument(
+        "--strip-youtube-metadata",
+        nargs="*",
+        metavar="DIR",
+        help=(
+            "Remove YouTube URL/description/comment-style metadata from MP3s under "
+            "the given directories (recursive). With no directories, defaults to 'music'."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.strip_youtube_metadata is not None:
+        dirs = [Path(d) for d in args.strip_youtube_metadata] or [MUSIC_DIR]
+        for root in dirs:
+            if not root.is_dir():
+                print(f"Skip missing directory: {root}")
+                continue
+            for mp3 in root.rglob("*.mp3"):
+                strip_youtube_metadata_from_file(mp3)
+        return
 
     input_value = input(
         "Enter a playlist keyword, playlist ID, or press Enter to update all playlists: "
