@@ -91,7 +91,8 @@ PLAYLISTS = {
     "runclub": "PL0MiauwawbNiJCWS4Y7W5EhYvyZgro58X",
     "video": "PL0MiauwawbNgNB6F4_rYeAAtgDyLTsh48",
     "birthday": "PL0MiauwawbNgdB3T531jO6KEL-wluc2xj",
-    "20260501": "PL0MiauwawbNhEphPsNS6Wcr2XipkYikZO"
+    "20260501": "PL0MiauwawbNhEphPsNS6Wcr2XipkYikZO",
+    "2026_summer": "PL0MiauwawbNiYcA8uELpZljJDAxvRcrFA"
 }
 
 
